@@ -4,7 +4,9 @@ import json
 import io
 import re
 
-# [CSS e CONFIGURAÇÃO DE INTERFACE MANTIDOS]
+# ==========================================
+# CONFIGURAÇÃO DE INTERFACE E TEMA GEOINT
+# ==========================================
 st.set_page_config(page_title="MDA Integrator - Track ETL", page_icon="🛰️", layout="wide")
 
 st.markdown("""
@@ -17,47 +19,68 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("🛰️ MDA & Narco-Tracking: Data Integrator")
+st.markdown("### Plataforma Automatizada de ETL Espacial")
 
-# Funções de Conversão Geodésica
+# ==========================================
+# FUNÇÕES DE APOIO (CONVERSÃO)
+# ==========================================
 def dms_to_dd(dms_str):
-    """Converte formato '6° 54'54.00"N' para Graus Decimais."""
+    """Converte '6° 54'54.00"N' para Graus Decimais."""
     dms_str = str(dms_str)
     match = re.search(r'(\d+)°\s*(\d+)\'(\d+\.?\d*)"([NSEW])', dms_str)
-    if not match:
-        return dms_str # Retorna original se não for DMS
-    
+    if not match: return dms_str
     deg, min, sec, dir = match.groups()
     dd = float(deg) + float(min)/60 + float(sec)/3600
-    if dir in ['S', 'W']: dd *= -1
-    return round(dd, 6)
+    return round(-dd, 6) if dir in ['S', 'W'] else round(dd, 6)
 
-# [MOTOR DE PROCESSAMENTO ATUALIZADO]
-@st.cache_data(show_spinner=False)
-def processar_arquivos(arquivos, fonte):
+# ==========================================
+# PAINEL DE CONTROLE (INTERFACE COMPLETA)
+# ==========================================
+col1, col2, col3 = st.columns(3)
+with col1:
+    fonte_dados = st.selectbox("Origem dos Dados:", ["SPOT", "PREPS", "GFW", "SKYlight", "Outros"])
+with col2:
+    software_destino = st.radio("Software Destino:", ["ArcGIS Pro", "QGIS"])
+with col3:
+    formato_saida = st.selectbox("Formato de Exportação:", ["CSV", "GeoJSON", "JSON", "KML", "GPX"])
+
+arquivos_upados = st.file_uploader("Arraste os arquivos aqui", accept_multiple_files=True)
+
+# ==========================================
+# PROCESSAMENTO TÁTICO
+# ==========================================
+if arquivos_upados and st.button("🚀 INICIAR PROCESSAMENTO"):
     lista_dfs = []
-    for arquivo in arquivos:
-        df = pd.read_excel(arquivo) if 'xls' in arquivo.name.lower() else pd.read_csv(arquivo)
-        
-        # Correção de Coordenadas PREPS/SPOT
+    for arquivo in arquivos_upados:
+        # Lógica de Leitura
+        if fonte_dados == "SPOT":
+            df_raw = pd.read_excel(arquivo, header=None)
+            mask = df_raw.apply(lambda row: row.astype(str).str.contains('Lat/Lng', case=False, na=False).any(), axis=1)
+            idx = df_raw[mask].index[0]
+            df = pd.read_excel(arquivo, header=idx)
+            # Divisão de Lat/Lng SPOT
+            lat_lng_col = next((c for c in df.columns if 'lat' in str(c).lower()), None)
+            df[['Latitude', 'Longitude']] = df[lat_lng_col].astype(str).str.split(',', n=1, expand=True)
+        else:
+            df = pd.read_excel(arquivo) if 'xls' in arquivo.name.lower() else pd.read_csv(arquivo)
+            
+        # Conversão de DMS para DD (essencial para PREPS)
         for col in ['Latitude', 'Longitude']:
             if col in df.columns:
                 df[col] = df[col].apply(dms_to_dd)
         
-        # Lógica de extração SPOT (Lat/Lng concat)
-        lat_lng_col = next((c for c in df.columns if 'lat' in str(c).lower() and 'lng' in str(c).lower()), None)
-        if lat_lng_col:
-            df[['Latitude', 'Longitude']] = df[lat_lng_col].astype(str).str.split(',', n=1, expand=True)
-            df['Latitude'] = pd.to_numeric(df['Latitude'].apply(dms_to_dd), errors='coerce')
-            df['Longitude'] = pd.to_numeric(df['Longitude'].apply(dms_to_dd), errors='coerce')
-            
         lista_dfs.append(df)
-        
-    df_final = pd.concat(lista_dfs, ignore_index=True)
-    return df_final.drop_duplicates()
 
-# [INTERFACE DE EXECUÇÃO]
-arquivos_upados = st.file_uploader("Carregue os arquivos", accept_multiple_files=True)
-if arquivos_upados and st.button("🚀 PROCESSAR PARA ARCGIS/QGIS"):
-    df_final = processar_arquivos(arquivos_upados, "PREPS/SPOT")
-    csv = df_final.to_csv(index=False, encoding='utf-8-sig').encode('utf-8')
-    st.download_button("⬇️ BAIXAR CSV NORMALIZADO", csv, "TrackData_WGS84_Decimal.csv", "text/csv")
+    df_final = pd.concat(lista_dfs, ignore_index=True).drop_duplicates()
+    
+    # Compatibilização de Cabeçalho (ArcGIS)
+    if software_destino == "ArcGIS Pro":
+        df_final.columns = df_final.columns.str.replace(' ', '_', regex=False).str.replace(r'[^\w\s]', '', regex=True)
+
+    # Exibição e Download
+    st.success(f"Processado: {len(df_final)} registros.")
+    st.dataframe(df_final.head())
+    
+    buffer = io.BytesIO()
+    df_final.to_csv(buffer, index=False, encoding='utf-8-sig')
+    st.download_button("⬇️ BAIXAR ARQUIVO UNIFICADO", buffer.getvalue(), f"TrackData_{fonte_dados}.csv", "text/csv")
