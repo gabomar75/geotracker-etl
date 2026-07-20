@@ -22,18 +22,15 @@ st.markdown("""
         color: #E0F7FA; 
     }
     
-    /* Títulos em Dourado */
     h1, h2, h3, h4 {
         color: #FFB81C !important; 
         font-family: 'Courier New', Courier, monospace;
     }
     
-    /* Textos secundários e rótulos em Ciano */
     p, label, .stRadio > label {
         color: #00E5FF !important; 
     }
     
-    /* Botões principais - Púrpura tático com texto Verde Radar */
     .stButton > button {
         background-color: #4A148C; 
         color: #00FF33 !important; 
@@ -43,7 +40,6 @@ st.markdown("""
         transition: all 0.3s ease;
     }
     
-    /* Efeito Hover dos botões */
     .stButton > button:hover {
         background-color: #00FF33;
         color: #4A148C !important;
@@ -51,14 +47,12 @@ st.markdown("""
         box-shadow: 0 0 10px #00FF33;
     }
     
-    /* Caixas de seleção */
     div[data-baseweb="select"] > div {
         background-color: #0A2F60;
         color: #00E5FF;
         border-color: #00E5FF;
     }
     
-    /* Upload area */
     div[data-testid="stFileUploadDropzone"] {
         background-color: #0A2F60;
         border: 2px dashed #00E5FF;
@@ -107,8 +101,21 @@ def processar_arquivos(arquivos, fonte):
         nome_arquivo = arquivo.name.lower()
         
         try:
+            # 1. LEITURA INTELIGENTE E LOCALIZAÇÃO DE CABEÇALHO
             if fonte == "SPOT" and ("xls" in nome_arquivo):
-                df = pd.read_excel(arquivo, skiprows=4, sheet_name=0)
+                # O SPOT exporta metadados no topo. Lemos tudo primeiro para achar a tabela real.
+                df_raw = pd.read_excel(arquivo, header=None, sheet_name=0)
+                
+                # Procura dinamicamente a linha que contém "Lat/Lng" ou "Date" ou "Events"
+                mask = df_raw.apply(lambda row: row.astype(str).str.contains('Lat/Lng|Latitude|Events|Date', case=False, na=False).any(), axis=1)
+                header_idx = df_raw[mask].index
+                
+                if not header_idx.empty:
+                    # Usa a linha encontrada como cabeçalho definitivo
+                    df = pd.read_excel(arquivo, header=header_idx[0], sheet_name=0)
+                else:
+                    df = pd.read_excel(arquivo, skiprows=5, sheet_name=0) # Fallback padrão
+                    
                 df = df.dropna(how='all', axis=1)
                 
             elif fonte == "Global Fishing Watch (GFW)" and ("csv" in nome_arquivo):
@@ -120,7 +127,21 @@ def processar_arquivos(arquivos, fonte):
             else:
                 df = pd.read_excel(arquivo)
                 
-            colunas_map = {col.strip().lower(): col for col in df.columns}
+            # 2. QUEBRA DE COORDENADAS CONCATENADAS (Típico do SPOT)
+            # Verifica se existe uma coluna unificada chamada 'Lat/Lng'
+            lat_lng_col = next((col for col in df.columns if 'lat/lng' in str(col).lower() or 'lat / lng' in str(col).lower()), None)
+            
+            if lat_lng_col:
+                # O SPOT junta as coordenadas (ex: "-12.972090, -38.515840"). Quebramos na vírgula.
+                df[['Latitude', 'Longitude']] = df[lat_lng_col].astype(str).str.split(',', n=1, expand=True)
+                df = df.drop(columns=[lat_lng_col])
+                
+                # Força a conversão para numérico puro, limpando espaços em branco
+                df['Latitude'] = pd.to_numeric(df['Latitude'].str.strip(), errors='coerce')
+                df['Longitude'] = pd.to_numeric(df['Longitude'].str.strip(), errors='coerce')
+
+            # 3. PADRONIZAÇÃO FINAL DE NOMES
+            colunas_map = {str(col).strip().lower(): col for col in df.columns}
             
             lat_col = colunas_map.get('lat', colunas_map.get('latitude', colunas_map.get('y', None)))
             lon_col = colunas_map.get('lon', colunas_map.get('longitude', colunas_map.get('x', None)))
@@ -139,7 +160,8 @@ def processar_arquivos(arquivos, fonte):
         
     df_final = pd.concat(lista_dfs, ignore_index=True)
     
-    colunas_tempo = ['Time Range', 'DataHora', 'timestamp', 'Entry timestamp', 'Data', 'Time']
+    # 4. LIMPEZA DE REDUNDÂNCIAS HISTÓRICAS
+    colunas_tempo = ['Time Range', 'DataHora', 'timestamp', 'Entry timestamp', 'Data', 'Time', 'Date']
     colunas_referencia = ['Latitude', 'Longitude']
     
     for col in colunas_tempo:
@@ -162,6 +184,7 @@ def processar_arquivos(arquivos, fonte):
 # ==========================================
 def gerar_download(df, formato, software):
     if software == "ArcGIS Pro (3.5.0+)":
+        # Remove espaços e caracteres especiais dos cabeçalhos para o ArcGIS não dar erro de Field Name
         df.columns = df.columns.str.replace(' ', '_', regex=False).str.replace(r'[^\w\s]', '', regex=True)
         
     tem_coord = 'Latitude' in df.columns and 'Longitude' in df.columns
@@ -178,7 +201,11 @@ def gerar_download(df, formato, software):
     elif formato == "GeoJSON" and tem_coord:
         df_geo = df.dropna(subset=['Latitude', 'Longitude']).copy()
         
-        # Rotina de conversão GeoJSON em Python puro (super rápida e sem dependências)
+        # Garante a conversão caso algo tenha passado
+        df_geo['Latitude'] = pd.to_numeric(df_geo['Latitude'], errors='coerce')
+        df_geo['Longitude'] = pd.to_numeric(df_geo['Longitude'], errors='coerce')
+        df_geo = df_geo.dropna(subset=['Latitude', 'Longitude'])
+        
         features = []
         for _, row in df_geo.iterrows():
             try:
@@ -195,7 +222,7 @@ def gerar_download(df, formato, software):
                     "properties": propriedades
                 })
             except:
-                continue # Ignora linhas onde lat/lon não são números válidos
+                continue 
                 
         geojson_dict = {
             "type": "FeatureCollection", 
@@ -224,14 +251,14 @@ def gerar_download(df, formato, software):
 if arquivos_upados:
     st.markdown("---")
     if st.button("🚀 INICIAR PROCESSAMENTO TÁTICO", use_container_width=True):
-        with st.spinner("Decodificando atributos, normalizando coordenadas e expurgando redundâncias históricas..."):
+        with st.spinner("Decodificando atributos, localizando coordenadas e expurgando redundâncias históricas..."):
             
             df_processado = processar_arquivos(arquivos_upados, fonte_dados)
             
             if df_processado is not None and not df_processado.empty:
-                st.success(f"✅ Fusão e Limpeza Concluídas! O arquivo mestre possui **{len(df_processado)} registros únicos**.")
+                st.success(f"✅ Fusão e Extração Concluídas! O arquivo mestre possui **{len(df_processado)} registros únicos**.")
                 
-                st.markdown("### Pré-visualização dos Dados Normalizados")
+                st.markdown("### Pré-visualização das Coordenadas Separadas")
                 st.dataframe(df_processado.head(10), use_container_width=True)
                 
                 file_bytes, ext, mime = gerar_download(df_processado, formato_saida, software_destino)
