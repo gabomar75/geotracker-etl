@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
-import geopandas as gpd
-from shapely.geometry import Point
+import json
 import io
 
 # ==========================================
@@ -109,9 +108,7 @@ def processar_arquivos(arquivos, fonte):
         
         try:
             if fonte == "SPOT" and ("xls" in nome_arquivo):
-                # O SPOT insere metadados nas primeiras linhas. Lemos a partir da linha 4
                 df = pd.read_excel(arquivo, skiprows=4, sheet_name=0)
-                # Limpa colunas totalmente vazias criadas por formatação corrompida
                 df = df.dropna(how='all', axis=1)
                 
             elif fonte == "Global Fishing Watch (GFW)" and ("csv" in nome_arquivo):
@@ -123,8 +120,6 @@ def processar_arquivos(arquivos, fonte):
             else:
                 df = pd.read_excel(arquivo)
                 
-            # Padronização de Colunas de Coordenadas para WGS84
-            # Mapeamento dinâmico ignorando case e espaços
             colunas_map = {col.strip().lower(): col for col in df.columns}
             
             lat_col = colunas_map.get('lat', colunas_map.get('latitude', colunas_map.get('y', None)))
@@ -142,10 +137,8 @@ def processar_arquivos(arquivos, fonte):
     if not lista_dfs:
         return None
         
-    # Fusão de todas as tabelas
     df_final = pd.concat(lista_dfs, ignore_index=True)
     
-    # Detecção e Exclusão de Séries Históricas Sobrepostas
     colunas_tempo = ['Time Range', 'DataHora', 'timestamp', 'Entry timestamp', 'Data', 'Time']
     colunas_referencia = ['Latitude', 'Longitude']
     
@@ -165,22 +158,13 @@ def processar_arquivos(arquivos, fonte):
     return df_final
 
 # ==========================================
-# GERAÇÃO DE OUTPUTS GEOSPACIAIS
+# GERAÇÃO DE OUTPUTS GEOSPACIAIS (NATIVO)
 # ==========================================
 def gerar_download(df, formato, software):
-    # Compatibilização ArcGis Pro (remove espaços e caracteres inválidos nos atributos)
     if software == "ArcGIS Pro (3.5.0+)":
         df.columns = df.columns.str.replace(' ', '_', regex=False).str.replace(r'[^\w\s]', '', regex=True)
         
     tem_coord = 'Latitude' in df.columns and 'Longitude' in df.columns
-    
-    if tem_coord and formato in ["GeoJSON"]:
-        df['Latitude'] = pd.to_numeric(df['Latitude'], errors='coerce')
-        df['Longitude'] = pd.to_numeric(df['Longitude'], errors='coerce')
-        df = df.dropna(subset=['Latitude', 'Longitude'])
-        
-        geometry = [Point(xy) for xy in zip(df['Longitude'], df['Latitude'])]
-        gdf = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
     
     buffer = io.BytesIO()
     mime_type = "text/plain"
@@ -192,7 +176,33 @@ def gerar_download(df, formato, software):
         extensao = "csv"
         
     elif formato == "GeoJSON" and tem_coord:
-        buffer.write(gdf.to_json().encode('utf-8'))
+        df_geo = df.dropna(subset=['Latitude', 'Longitude']).copy()
+        
+        # Rotina de conversão GeoJSON em Python puro (super rápida e sem dependências)
+        features = []
+        for _, row in df_geo.iterrows():
+            try:
+                lat = float(row['Latitude'])
+                lon = float(row['Longitude'])
+                propriedades = row.to_dict()
+                
+                features.append({
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [lon, lat]
+                    },
+                    "properties": propriedades
+                })
+            except:
+                continue # Ignora linhas onde lat/lon não são números válidos
+                
+        geojson_dict = {
+            "type": "FeatureCollection", 
+            "features": features
+        }
+        
+        buffer.write(json.dumps(geojson_dict).encode('utf-8'))
         mime_type = "application/geo+json"
         extensao = "geojson"
         
@@ -202,8 +212,6 @@ def gerar_download(df, formato, software):
         extensao = "json"
         
     elif formato in ["KML", "GPX"]:
-        # Exporta como CSV limpo, já que o processamento web de KML puro via Fiona exige dependências C pesadas (GDAL)
-        # O CSV resultante importará perfeitamente nos módulos de conversão nativos.
         df.to_csv(buffer, index=False, encoding='utf-8-sig') 
         mime_type = "text/csv"
         extensao = "csv"
